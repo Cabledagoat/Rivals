@@ -1,0 +1,933 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local player = Players.LocalPlayer
+assert(player, "Run after joining the game")
+local env = (type(getgenv) == "function" and getgenv()) or _G
+local previous = env.PrivateClientTest
+if type(previous) == "table" and type(previous.Unload) == "function" then pcall(previous.Unload) end
+
+local Config = {
+    Aim = false, Trigger = false, Rage = false,
+    Box = false, Health = false, Highlight = false, Skeleton = false, Fullbright = false,
+    ShowFOV = true, TeamCheck = false, VisibleOnly = true, NPCOnly = false,
+    FOV = 180, Smoothing = 0.12, AimStrength = 450, TriggerDelay = 0.10,
+    ShotInterval = 0.15, RageHeight = 9, MaxDistance = 2500, LockGrace = 0.18,
+    TrackingDamping = 0.03,
+    FirstPersonOnly = true, FirstPersonDistance = 2.5,
+}
+local active, focused, menuOpen, minimized = true, true, false, false
+local connections, visuals = {}, {}
+local aimLock, aimTrack, triggerTarget, cursorSaved, drag, fireIssue
+local refreshNPCs
+local npcSummary = "NPC scan not started"
+local lastGameplayStatus = "No gameplay check yet"
+local triggerSince, lastShot = 0, -math.huge
+local aimReady = false
+local click = type(mouse1click) == "function" and mouse1click or nil
+local bindName = "PrivateClientTest_Render"
+local green, red = Color3.fromRGB(70, 255, 125), Color3.fromRGB(255, 75, 85)
+local white = Color3.fromRGB(230, 237, 248)
+local function make(class, props, parent)
+    local obj = Instance.new(class)
+    for key, value in pairs(props) do obj[key] = value end
+    obj.Parent = parent
+    return obj
+end
+local function connect(signal, fn)
+    local connection = signal:Connect(fn)
+    table.insert(connections, connection)
+    return connection
+end
+
+-- BEGIN FULLBRIGHT LOGIC
+local savedLighting
+local brightLighting = {
+    Brightness = 2, ClockTime = 14, GlobalShadows = false, ExposureCompensation = 0,
+    Ambient = Color3.fromRGB(255, 255, 255), OutdoorAmbient = Color3.fromRGB(255, 255, 255),
+}
+local function syncFullbright(enabled)
+    if enabled then
+        if not savedLighting then
+            savedLighting = {}
+            for property in pairs(brightLighting) do savedLighting[property] = Lighting[property] end
+        end
+        for property, value in pairs(brightLighting) do
+            if Lighting[property] ~= value then Lighting[property] = value end
+        end
+    elseif savedLighting then
+        local failure
+        for property, value in pairs(savedLighting) do
+            local ok, err = pcall(function() Lighting[property] = value end)
+            if ok then savedLighting[property] = nil else failure = err end
+        end
+        if next(savedLighting) == nil then savedLighting = nil end
+        if failure then error("Lighting restore failed: " .. tostring(failure)) end
+    end
+end
+-- END FULLBRIGHT LOGIC
+
+-- BEGIN CURSOR LOGIC
+local function updateCursor(wanted)
+    if wanted then
+        if not cursorSaved then
+            cursorSaved = {
+                behavior = UIS.MouseBehavior,
+                enabled = UIS.MouseIconEnabled,
+                icon = UIS.MouseIcon,
+            }
+        end
+        UIS.MouseBehavior = Enum.MouseBehavior.Default
+        UIS.MouseIconEnabled = true
+        UIS.MouseIcon = ""
+    elseif cursorSaved then
+        local saved = cursorSaved
+        local behaviorOK, behaviorError = pcall(function() UIS.MouseBehavior = saved.behavior end)
+        local enabledOK, enabledError = pcall(function() UIS.MouseIconEnabled = saved.enabled end)
+        local iconOK, iconError = pcall(function() UIS.MouseIcon = saved.icon end)
+        if behaviorOK and enabledOK and iconOK then
+            cursorSaved = nil
+        else
+            error("Cursor restore failed: " .. tostring(behaviorError or enabledError or iconError))
+        end
+    end
+end
+-- END CURSOR LOGIC
+
+local gui = make("ScreenGui", {
+    Name = "PrivateClientTest", IgnoreGuiInset = true, ResetOnSpawn = false,
+    DisplayOrder = 999, ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, player:WaitForChild("PlayerGui"))
+local overlay = make("Frame", {
+    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+}, gui)
+local circle = make("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
+    Size = UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2),
+}, overlay)
+make("UICorner", {CornerRadius = UDim.new(1, 0)}, circle)
+make("UIStroke", {Color = white, Thickness = 1, Transparency = 0.2}, circle)
+local launcher = make("TextButton", {
+    Name = "LightningMenuButton", Position = UDim2.new(0, 16, 1, -128),
+    Size = UDim2.fromOffset(64, 64), BackgroundColor3 = Color3.fromRGB(20, 24, 32),
+    BorderSizePixel = 0, Text = "⚡", TextColor3 = Color3.fromRGB(255, 220, 90),
+    Font = Enum.Font.SourceSansBold, TextSize = 46, ZIndex = 20, Modal = false,
+}, gui)
+make("UICorner", {CornerRadius = UDim.new(0, 14)}, launcher)
+make("UIStroke", {Color = Color3.fromRGB(65, 74, 93), Thickness = 1,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, launcher)
+local launcherMoved, launcherGesture = false, nil
+local window = make("Frame", {
+    Position = UDim2.fromOffset(18, 70), Size = UDim2.fromOffset(300, 624),
+    BackgroundColor3 = Color3.fromRGB(20, 24, 32), BorderSizePixel = 0,
+    ClipsDescendants = true, ZIndex = 10, Visible = false,
+}, gui)
+local function headerButton(text, position, size, color)
+    return make("TextButton", {
+        Position = position, Size = size, Text = text, Font = Enum.Font.Code,
+        TextSize = 15, TextColor3 = white, BackgroundColor3 = color,
+        BorderSizePixel = 0, ZIndex = 12, Modal = false,
+    }, window)
+end
+local title = headerButton("CLIENT TEST v6", UDim2.fromOffset(0, 0),
+    UDim2.new(1, -68, 0, 34), Color3.fromRGB(30, 37, 49))
+title.AutoButtonColor = false
+local function syncCursor()
+    local wanted = active and focused and menuOpen and not GuiService.MenuIsOpen
+    if wanted then
+        if UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+            -- Let native RMB orbit use the mouse. Keep the pre-menu snapshot;
+            -- don't replace it with the temporary RMB LockCurrentPosition state.
+            title.Modal = false
+            return
+        end
+        -- Capture original settings before Modal can influence MouseBehavior.
+        updateCursor(true)
+        title.Modal = true
+    else
+        -- Release the modal override before restoring the game's cursor state.
+        title.Modal = false
+        updateCursor(false)
+    end
+end
+local minimizeButton = headerButton("-", UDim2.new(1, -66, 0, 0),
+    UDim2.fromOffset(32, 34), Color3.fromRGB(35, 41, 54))
+local closeButton = headerButton("X", UDim2.new(1, -32, 0, 0),
+    UDim2.fromOffset(32, 34), Color3.fromRGB(135, 42, 53))
+local panel = make("ScrollingFrame", {
+    Position = UDim2.fromOffset(0, 34), Size = UDim2.new(1, 0, 1, -34),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 4,
+    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ZIndex = 10,
+}, window)
+make("UIPadding", {
+    PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10),
+    PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
+}, panel)
+make("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, panel)
+local order = 0
+local function row(class, text, height)
+    order = order + 1
+    return make(class, {
+        Size = UDim2.new(1, -4, 0, height or 28), LayoutOrder = order,
+        BackgroundColor3 = Color3.fromRGB(35, 41, 54), BorderSizePixel = 0,
+        Font = Enum.Font.Code, TextSize = 13, TextColor3 = white,
+        Text = text, ZIndex = 11,
+    }, panel)
+end
+row("TextLabel", "1. Enable Aim\n2. PLAY  3. Hold RMB", 38)
+local playButton = row("TextButton", "PLAY / HIDE SETTINGS [RightShift]", 34)
+playButton.TextColor3 = green
+local status = row("TextLabel", "Settings open: combat helpers paused", 82)
+status.TextWrapped = true
+
+local function viewport()
+    local camera = Workspace.CurrentCamera
+    return camera and camera.ViewportSize or Vector2.new(1280, 720)
+end
+local function moveWindow(x, y)
+    local size = viewport()
+    window.Position = UDim2.fromOffset(
+        math.clamp(x, 0, math.max(0, size.X - window.Size.X.Offset)),
+        math.clamp(y, 0, math.max(0, size.Y - window.Size.Y.Offset)))
+end
+local function moveLauncher(x, y)
+    local size = viewport()
+    launcher.Position = UDim2.fromOffset(
+        math.clamp(x, 0, math.max(0, size.X - 64)),
+        math.clamp(y, 0, math.max(0, size.Y - 64)))
+end
+local function resizeWindow()
+    local size = viewport()
+    window.Size = UDim2.fromOffset(math.min(300, math.max(160, size.X - 20)),
+        minimized and 34 or math.min(624, math.max(72, size.Y - 40)))
+    moveWindow(window.Position.X.Offset, window.Position.Y.Offset)
+    if launcherMoved then moveLauncher(launcher.Position.X.Offset, launcher.Position.Y.Offset) end
+end
+local function stopDrag()
+    if drag and drag.kind == "launcher" and not drag.released then drag.cancelled = true end
+    drag = nil
+    panel.ScrollingEnabled = true
+end
+local function resetCombat()
+    aimLock, aimTrack, triggerTarget = nil, nil, nil
+    triggerSince = 0
+    aimReady = false
+end
+local function setMenu(open, compact)
+    stopDrag()
+    resetCombat()
+    local textBox = UIS:GetFocusedTextBox()
+    if textBox and textBox:IsDescendantOf(gui) then textBox:ReleaseFocus() end
+    menuOpen, minimized = open, compact == true
+    window.Visible = open or minimized
+    panel.Visible = open
+    minimizeButton.Text = minimized and "+" or "-"
+    title.Text = minimized and "RightShift: settings" or "CLIENT TEST v6"
+    resizeWindow()
+    syncCursor()
+end
+connect(playButton.Activated, function() setMenu(false, false) end)
+connect(launcher.InputBegan, function(input)
+    if drag or not focused or GuiService.MenuIsOpen then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        local point = Vector2.new(input.Position.X, input.Position.Y)
+        launcherGesture = {kind = "launcher", input = input, start = point,
+            offset = point - launcher.AbsolutePosition, moved = false, cancelled = false}
+        drag = launcherGesture
+    end
+end)
+connect(launcher.Activated, function(input)
+    if not active or not focused or GuiService.MenuIsOpen then return end
+    if drag and drag ~= launcherGesture then return end
+    local pointer = input and (input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch)
+    if input and input.UserInputType == Enum.UserInputType.Touch
+        and (not launcherGesture or input ~= launcherGesture.input) then return end
+    if pointer and launcherGesture and (launcherGesture.moved or launcherGesture.cancelled) then return end
+    setMenu(not menuOpen, false)
+end)
+connect(minimizeButton.Activated, function()
+    if minimized then setMenu(true, false) else setMenu(false, true) end
+end)
+connect(title.InputBegan, function(input)
+    if not menuOpen or drag then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        drag = {kind = "window", input = input,
+            offset = Vector2.new(input.Position.X, input.Position.Y) - window.AbsolutePosition}
+    end
+end)
+
+local buttons = {}
+local function refresh()
+    for key, info in pairs(buttons) do
+        info.button.Text = info.label .. ": " .. (Config[key] and "ON" or "OFF")
+        info.button.TextColor3 = Config[key] and green or white
+    end
+end
+local function toggle(key, label)
+    local button = row("TextButton", "")
+    buttons[key] = {button = button, label = label}
+    connect(button.Activated, function()
+        Config[key] = not Config[key]
+        resetCombat()
+        refresh()
+    end)
+end
+toggle("Aim", "Aimbot (hold RMB in gameplay)")
+toggle("NPCOnly", "NPCs only (ignore all players)")
+local rescanButton = row("TextButton", "Rescan NPCs")
+connect(rescanButton.Activated, function()
+    if refreshNPCs then refreshNPCs(); resetCombat() end
+end)
+toggle("FirstPersonOnly", "Combat only in first person")
+local strengthLabel = row("TextLabel", "", 22)
+local strengthBar = row("TextButton", "", 30)
+strengthBar.AutoButtonColor = false
+local track = make("Frame", {
+    Position = UDim2.new(0, 10, 0.5, -3), Size = UDim2.new(1, -20, 0, 6),
+    BackgroundColor3 = Color3.fromRGB(55, 65, 83), BorderSizePixel = 0, ZIndex = 12,
+}, strengthBar)
+local fill = make("Frame", {BackgroundColor3 = green, BorderSizePixel = 0, ZIndex = 13}, track)
+local knob = make("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(16, 16),
+    BackgroundColor3 = white, BorderSizePixel = 0, ZIndex = 14,
+}, track)
+make("UICorner", {CornerRadius = UDim.new(1, 0)}, knob)
+local function showStrength()
+    local fraction = (Config.AimStrength - 1) / 449
+    strengthLabel.Text = string.format("Strength: %d / 450%s", Config.AimStrength,
+        Config.AimStrength == 450 and " (SNAP)" or "")
+    fill.Size = UDim2.fromScale(fraction, 1)
+    knob.Position = UDim2.fromScale(fraction, 0.5)
+end
+local function setStrength(x)
+    if track.AbsoluteSize.X <= 0 then return end
+    local fraction = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+    Config.AimStrength = math.floor(1 + fraction * 449 + 0.5)
+    showStrength()
+end
+connect(strengthBar.InputBegan, function(input)
+    if not menuOpen or drag then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        drag = {kind = "strength", input = input}
+        panel.ScrollingEnabled = false
+        setStrength(input.Position.X)
+    end
+end)
+connect(UIS.InputChanged, function(input)
+    if not drag then return end
+    if input == drag.input or (drag.input.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseMovement) then
+        if drag.kind == "launcher" then
+            local point = Vector2.new(input.Position.X, input.Position.Y)
+            if (point - drag.start).Magnitude >= 6 then drag.moved = true end
+            if drag.moved then
+                local pos = point - drag.offset
+                launcherMoved = true
+                moveLauncher(pos.X, pos.Y)
+            end
+        elseif drag.kind == "strength" then setStrength(input.Position.X)
+        else
+            local pos = Vector2.new(input.Position.X, input.Position.Y) - drag.offset
+            moveWindow(pos.X, pos.Y)
+        end
+    end
+end)
+connect(UIS.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        aimLock, aimTrack = nil, nil
+        if not menuOpen and focused then aimReady = true end
+    end
+    if drag and (input == drag.input or (drag.input.UserInputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+        if drag.kind == "launcher" then
+            local point = Vector2.new(input.Position.X, input.Position.Y)
+            if (point - drag.start).Magnitude >= 6 then drag.moved = true end
+            drag.released = true
+        end
+        stopDrag()
+    end
+end)
+showStrength()
+toggle("Trigger", "Triggerbot")
+toggle("Rage", "Teleport + fire (experimental)")
+toggle("Box", "ESP boxes")
+toggle("Health", "ESP health")
+toggle("Highlight", "ESP visibility highlight")
+toggle("Skeleton", "ESP skeleton")
+toggle("Fullbright", "Fullbright")
+toggle("TeamCheck", "Ignore same Roblox Team")
+toggle("VisibleOnly", "Aim at visible targets only")
+toggle("ShowFOV", "Show FOV circle")
+local function numberInput(key, label, minimum, maximum)
+    row("TextLabel", label, 20)
+    local input = row("TextBox", tostring(Config[key]), 26)
+    input.ClearTextOnFocus = false
+    connect(input.FocusLost, function()
+        local value = tonumber(input.Text)
+        if value and value == value then Config[key] = math.clamp(value, minimum, maximum) end
+        input.Text = tostring(Config[key])
+    end)
+end
+numberInput("FOV", "Acquire FOV: 20-500 pixels", 20, 500)
+numberInput("Smoothing", "Smoothing: 0-1 sec (0 = snap)", 0, 1)
+numberInput("TrackingDamping", "Head damping: 0-0.15 sec", 0, 0.15)
+numberInput("TriggerDelay", "Trigger delay: 0-1 sec", 0, 1)
+numberInput("ShotInterval", "Shot interval: 0.05-2 sec", 0.05, 2)
+numberInput("RageHeight", "Teleport height: 5-30 studs", 5, 30)
+row("TextLabel", "No inventory unlocks.\nTeam check uses Roblox Teams only.", 38)
+local unloadButton = row("TextButton", "STOP AND REMOVE GUI", 30)
+refresh()
+
+local function destroyVisual(p)
+    local v = visuals[p]
+    if v then v.frame:Destroy(); v.highlight:Destroy(); visuals[p] = nil end
+end
+local cleanupComplete = false
+local function unload()
+    if cleanupComplete then return end
+    active = false
+    local allClean = true
+    local function attempt(label, fn)
+        local ok, err = pcall(fn)
+        if not ok then
+            allClean = false
+            warn("Client test cleanup (" .. label .. "): " .. tostring(err))
+        end
+    end
+    -- Each step runs even if another one fails. Failed cleanup remains retryable.
+    attempt("render binding", function() RunService:UnbindFromRenderStep(bindName) end)
+    for _, conn in ipairs(connections) do attempt("connection", function() conn:Disconnect() end) end
+    attempt("modal", function() title.Modal = false end)
+    attempt("lighting", function() syncFullbright(false) end)
+    attempt("cursor", function() updateCursor(false) end)
+    attempt("drag", stopDrag)
+    resetCombat()
+    for p in pairs(visuals) do attempt("ESP", function() destroyVisual(p) end) end
+    attempt("GUI", function() gui:Destroy() end)
+    cleanupComplete = allClean
+    if allClean and env.PrivateClientTest and env.PrivateClientTest.Unload == unload then env.PrivateClientTest = nil end
+end
+local api = {Config = Config, Unload = unload, Status = "Gameplay: RightShift opens settings"}
+env.PrivateClientTest = api
+connect(unloadButton.Activated, unload)
+connect(closeButton.Activated, unload)
+connect(Players.PlayerRemoving, destroyVisual)
+connect(player.CharacterAdded, function() setMenu(false, false) end)
+connect(UIS.WindowFocusReleased, function()
+    focused = false
+    stopDrag()
+    resetCombat()
+    syncCursor()
+end)
+connect(UIS.WindowFocused, function()
+    focused = true
+    resetCombat()
+    syncCursor()
+end)
+local function coreMenuChanged()
+    stopDrag()
+    resetCombat()
+    syncCursor()
+end
+connect(GuiService.MenuOpened, coreMenuChanged)
+connect(GuiService.MenuClosed, coreMenuChanged)
+connect(UIS.InputBegan, function(input)
+    if input.KeyCode == Enum.KeyCode.End then unload(); return end
+    if menuOpen and input.UserInputType == Enum.UserInputType.MouseButton2 then
+        stopDrag()
+        return
+    end
+    if GuiService.MenuIsOpen then return end
+    if input.KeyCode == Enum.KeyCode.RightShift or input.KeyCode == Enum.KeyCode.Insert then
+        local box = UIS:GetFocusedTextBox()
+        if not box or box:IsDescendantOf(gui) then setMenu(not menuOpen, false) end
+    end
+end)
+
+local function alive(p)
+    local character = p.Character
+    if not character then return end
+    local isNPC = type(p) == "table" and p.IsNPC
+    local humanoid = isNPC and p.Humanoid or character:FindFirstChildOfClass("Humanoid")
+    if humanoid and not humanoid:IsDescendantOf(character) then return end
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local head = character and character:FindFirstChild("Head")
+    if isNPC and humanoid then
+        local function validPart(part)
+            return part and part:IsA("BasePart") and part:IsDescendantOf(character) and part or nil
+        end
+        local function namedPart(name)
+            local found = character:FindFirstChild(name, true)
+            if not found then return nil end
+            return validPart(found) or validPart(found:FindFirstChildWhichIsA("BasePart", true))
+        end
+        root = validPart(humanoid.RootPart) or validPart(character.PrimaryPart)
+            or namedPart("HumanoidRootPart") or namedPart("Torso") or namedPart("UpperTorso")
+            or namedPart("Root") or namedPart("Body")
+            or validPart(character:FindFirstChildWhichIsA("BasePart", true))
+        head = namedPart("Head") or root
+    end
+    if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") and head and head:IsA("BasePart") then
+        return character, humanoid, root, head
+    end
+end
+-- BEGIN VIEW GATE LOGIC
+local function combatViewAllowed(camera, head)
+    if not Config.FirstPersonOnly then return true end
+    if not camera or not head then return false end
+    return (camera.CFrame.Position - head.Position).Magnitude <= Config.FirstPersonDistance
+end
+-- END VIEW GATE LOGIC
+-- BEGIN TARGET SOURCE LOGIC
+local npcRecords = {}
+local playerCharacters = setmetatable({}, {__mode = "k"})
+local npcIndexReady = false
+local function npcModelAllowed(model)
+    if not model or not model:IsDescendantOf(Workspace) then return false end
+    local camera = Workspace.CurrentCamera
+    if camera and model:IsDescendantOf(camera) then return false end
+    local ancestor = model
+    while ancestor and ancestor ~= Workspace do
+        if playerCharacters[ancestor] then return false end
+        ancestor = ancestor.Parent
+    end
+    return true
+end
+local function enemy(p)
+    if type(p) == "table" and p.IsNPC then
+        return Config.NPCOnly and npcModelAllowed(p.Character)
+    end
+    if Config.NPCOnly then return false end
+    return p ~= player and not (Config.TeamCheck and player.Team ~= nil and p.Team == player.Team)
+end
+local function registerNPC(instance)
+    if not instance:IsA("Humanoid") then return end
+    local model = instance:FindFirstAncestorOfClass("Model")
+    if not model then return end
+    local record = npcRecords[model]
+    if not record then
+        record = {IsNPC = true, Character = model, DisplayName = model.Name}
+        npcRecords[model] = record
+    end
+    record.Humanoid = instance
+end
+local function ensureNPCIndex()
+    if npcIndexReady then return end
+    npcIndexReady = true
+    local function trackPlayer(p)
+        local function mark(character)
+            playerCharacters[character] = true
+            local record = npcRecords[character]
+            if record then destroyVisual(record) end
+        end
+        if p.Character then mark(p.Character) end
+        connect(p.CharacterAdded, mark)
+    end
+    for _, p in ipairs(Players:GetPlayers()) do trackPlayer(p) end
+    connect(Players.PlayerAdded, trackPlayer)
+    connect(Workspace.DescendantAdded, registerNPC)
+    connect(Workspace.DescendantRemoving, function(instance)
+        local humanoidRemoved = instance:IsA("Humanoid")
+        local model = humanoidRemoved and instance:FindFirstAncestorOfClass("Model") or instance
+        local record = npcRecords[model]
+        if record and (not humanoidRemoved or record.Humanoid == instance) then
+            destroyVisual(record); npcRecords[model] = nil
+        end
+    end)
+    -- One initial scan; subsequent NPC spawns/removals use events.
+    for _, instance in ipairs(Workspace:GetDescendants()) do registerNPC(instance) end
+end
+local function getTargets()
+    if not Config.NPCOnly then return Players:GetPlayers() end
+    ensureNPCIndex()
+    -- Refresh current ownership as well as remembering past player characters.
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then playerCharacters[p.Character] = true end
+    end
+    local targets, incomplete, dead = {}, 0, 0
+    for model, record in pairs(npcRecords) do
+        if npcModelAllowed(model) then
+            local character, humanoid = alive(record)
+            if character then
+                record.DisplayName = humanoid.DisplayName ~= "" and humanoid.DisplayName or model.Name
+                table.insert(targets, record)
+            elseif record.Humanoid and record.Humanoid.Health <= 0 then
+                dead = dead + 1
+            else
+                incomplete = incomplete + 1
+            end
+        end
+    end
+    npcSummary = string.format("NPCs: %d ready, %d incomplete, %d dead", #targets, incomplete, dead)
+    return targets
+end
+refreshNPCs = function()
+    if not npcIndexReady then ensureNPCIndex()
+    else
+        for model, record in pairs(npcRecords) do
+            if not model:IsDescendantOf(Workspace) or not record.Humanoid
+                or not record.Humanoid:IsDescendantOf(model) then
+                destroyVisual(record)
+                npcRecords[model] = nil
+            end
+        end
+        for _, instance in ipairs(Workspace:GetDescendants()) do registerNPC(instance) end
+    end
+    if Config.NPCOnly then getTargets() end
+end
+-- END TARGET SOURCE LOGIC
+local function rayParams(camera)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local ignore = {camera}
+    if player.Character then table.insert(ignore, player.Character) end
+    params.FilterDescendantsInstances = ignore
+    return params
+end
+local function visible(camera, params, character, point)
+    local origin = camera.CFrame.Position
+    local hit = Workspace:Raycast(origin, point - origin, params)
+    return hit == nil or hit.Instance:IsDescendantOf(character)
+end
+local function lookAt(from, to, preferredUp)
+    local delta = to - from
+    if delta.Magnitude < 0.001 then return nil end
+    local direction = delta.Unit
+    local reference = preferredUp or Vector3.new(0, 1, 0)
+    local up = reference - direction * reference:Dot(direction)
+    if up.Magnitude < 0.001 then
+        reference = math.abs(direction.Z) < 0.9 and Vector3.new(0, 0, 1) or Vector3.new(1, 0, 0)
+        up = reference - direction * reference:Dot(direction)
+    end
+    return CFrame.lookAt(from, to, up.Unit)
+end
+local function overWindow()
+    local mouse = UIS:GetMouseLocation()
+    local function contains(control)
+        if not control.Visible then return false end
+        local pos, size = control.AbsolutePosition, control.AbsoluteSize
+        return mouse.X >= pos.X and mouse.Y >= pos.Y
+            and mouse.X <= pos.X + size.X and mouse.Y <= pos.Y + size.Y
+    end
+    -- Synthetic firing must not click either the menu or its launcher.
+    return contains(window) or contains(launcher)
+end
+local function fire(now)
+    if menuOpen or GuiService.MenuIsOpen or not focused or drag or UIS:GetFocusedTextBox() or overWindow() then return end
+    if now - lastShot < Config.ShotInterval then return end
+    lastShot = now
+    if click then
+        local ok = pcall(click)
+        if ok then fireIssue = nil; return end
+        click = nil
+    end
+    local tool = player.Character and player.Character:FindFirstChildOfClass("Tool")
+    if tool and pcall(function() tool:Activate() end) then
+        fireIssue = nil
+        task.delay(0.03, function() if tool.Parent then pcall(function() tool:Deactivate() end) end end)
+    else fireIssue = "No working fire input" end
+end
+
+-- BEGIN AIM LOCK LOGIC
+local function chooseAimTarget(candidates, now, enabled)
+    if not enabled then aimLock = nil; return nil, "Aim idle" end
+    if aimLock then
+        local retained
+        for _, candidate in ipairs(candidates) do
+            if candidate.player == aimLock.player and candidate.character == aimLock.character then retained = candidate; break end
+        end
+        if retained then
+            local clear = not Config.VisibleOnly or retained.seen
+            -- Screen projection uses the game's uncorrected camera. It must not
+            -- invalidate a held lock when that camera resets/recoils before us.
+            if clear then
+                aimLock.invalidSince = nil
+                return retained, "Locked: " .. retained.player.DisplayName
+            end
+            aimLock.invalidSince = aimLock.invalidSince or now
+            if now - aimLock.invalidSince < Config.LockGrace then
+                return nil, "Target blocked; holding last view"
+            end
+        end
+        aimLock = nil
+    end
+    local selected
+    local bestDistance = Config.FOV
+    for _, candidate in ipairs(candidates) do
+        if candidate.onScreen and candidate.distance <= bestDistance and (not Config.VisibleOnly or candidate.seen) then
+            selected, bestDistance = candidate, candidate.distance
+        end
+    end
+    if selected then
+        aimLock = {player = selected.player, character = selected.character}
+        return selected, "Locked: " .. selected.player.DisplayName
+    end
+    return nil, "No eligible target in FOV"
+end
+-- END AIM LOCK LOGIC
+
+-- BEGIN AIM TRACKING LOGIC
+local function updateAimTracking(selected, dt)
+    local rawOffset = selected.head.Position - selected.root.Position
+    if not aimTrack or aimTrack.player ~= selected.player
+        or aimTrack.character ~= selected.character or aimTrack.head ~= selected.head then
+        aimTrack = {player = selected.player, character = selected.character,
+            head = selected.head, offset = rawOffset, rotation = nil}
+    else
+        local damping = math.max(Config.TrackingDamping, 0)
+        local alpha = damping == 0 and 1 or (1 - math.exp(-math.max(dt, 0) / damping))
+        aimTrack.offset = aimTrack.offset:Lerp(rawOffset, alpha)
+    end
+    -- Follow the root immediately; only the animated head offset is damped.
+    return selected.root.Position + aimTrack.offset
+end
+-- END AIM TRACKING LOGIC
+
+local edges = {
+    {"Head", "UpperTorso"}, {"UpperTorso", "LowerTorso"},
+    {"UpperTorso", "LeftUpperArm"}, {"LeftUpperArm", "LeftLowerArm"}, {"LeftLowerArm", "LeftHand"},
+    {"UpperTorso", "RightUpperArm"}, {"RightUpperArm", "RightLowerArm"}, {"RightLowerArm", "RightHand"},
+    {"LowerTorso", "LeftUpperLeg"}, {"LeftUpperLeg", "LeftLowerLeg"}, {"LeftLowerLeg", "LeftFoot"},
+    {"LowerTorso", "RightUpperLeg"}, {"RightUpperLeg", "RightLowerLeg"}, {"RightLowerLeg", "RightFoot"},
+    {"Head", "Torso"}, {"Torso", "Left Arm"}, {"Torso", "Right Arm"}, {"Torso", "Left Leg"}, {"Torso", "Right Leg"},
+}
+local function createVisual(p)
+    local frame = make("Frame", {Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1}, overlay)
+    local box = make("Frame", {BackgroundTransparency = 1, Visible = false}, frame)
+    local stroke = make("UIStroke", {Color = green, Thickness = 1.5}, box)
+    local health = make("TextLabel", {BackgroundTransparency = 1, Font = Enum.Font.Code,
+        TextSize = 13, TextColor3 = white, TextStrokeTransparency = 0.3, Visible = false}, frame)
+    local highlight = make("Highlight", {Enabled = false, DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+        FillTransparency = 0.6, OutlineTransparency = 0}, gui)
+    local lines = {}
+    for i = 1, #edges do
+        lines[i] = make("Frame", {AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0,
+            BackgroundColor3 = green, Visible = false}, frame)
+    end
+    local v = {frame = frame, box = box, stroke = stroke, health = health, highlight = highlight, lines = lines}
+    visuals[p] = v
+    return v
+end
+local function bounds(camera, character)
+    local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+    for _, part in ipairs(character:GetChildren()) do
+        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+            for x = -1, 1, 2 do for y = -1, 1, 2 do for z = -1, 1, 2 do
+                local point = camera:WorldToViewportPoint(part.CFrame:PointToWorldSpace(part.Size * Vector3.new(x, y, z) * 0.5))
+                if point.Z <= 0.1 then return nil end
+                minX, minY = math.min(minX, point.X), math.min(minY, point.Y)
+                maxX, maxY = math.max(maxX, point.X), math.max(maxY, point.Y)
+            end end end
+        end
+    end
+    local size = camera.ViewportSize
+    if minX == math.huge or maxX < 0 or maxY < 0 or minX > size.X or minY > size.Y then return nil end
+    return minX, minY, maxX - minX, maxY - minY
+end
+local function updateVisual(p, character, humanoid, color, camera)
+    local v = visuals[p] or createVisual(p)
+    v.frame.Visible = true
+    v.highlight.Adornee, v.highlight.Enabled = character, Config.Highlight
+    v.highlight.FillColor, v.highlight.OutlineColor = color, color
+    v.box.Visible, v.health.Visible = false, false
+    if Config.Box or Config.Health then
+        local x, y, w, h = bounds(camera, character)
+        if x then
+            v.box.Position, v.box.Size = UDim2.fromOffset(x, y), UDim2.fromOffset(w, h)
+            v.stroke.Color, v.box.Visible = color, Config.Box
+            v.health.Position, v.health.Size = UDim2.fromOffset(x - 40, y - 20), UDim2.fromOffset(w + 80, 18)
+            v.health.Text = string.format("%s %d/%d HP", p.DisplayName, math.ceil(humanoid.Health), math.ceil(humanoid.MaxHealth))
+            v.health.TextColor3, v.health.Visible = color, Config.Health
+        end
+    end
+    for i, edge in ipairs(edges) do
+        local line = v.lines[i]
+        line.Visible = false
+        if Config.Skeleton then
+            local a, b = character:FindFirstChild(edge[1]), character:FindFirstChild(edge[2])
+            if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+                local pa, onA = camera:WorldToViewportPoint(a.Position)
+                local pb, onB = camera:WorldToViewportPoint(b.Position)
+                if onA and onB and pa.Z > 0.1 and pb.Z > 0.1 then
+                    local start, finish = Vector2.new(pa.X, pa.Y), Vector2.new(pb.X, pb.Y)
+                    local delta, mid = finish - start, (start + finish) * 0.5
+                    line.Position, line.Size = UDim2.fromOffset(mid.X, mid.Y), UDim2.fromOffset(delta.Magnitude, 1.5)
+                    line.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+                    line.BackgroundColor3, line.Visible = color, true
+                end
+            end
+        end
+    end
+end
+local function renderESP(camera, params)
+    for _, v in pairs(visuals) do v.frame.Visible = false; v.highlight.Enabled = false end
+    if not (Config.Box or Config.Health or Config.Highlight or Config.Skeleton) then return end
+    for _, p in ipairs(getTargets()) do
+        if enemy(p) then
+            local character, humanoid, _, head = alive(p)
+            if character and (head.Position - camera.CFrame.Position).Magnitude <= Config.MaxDistance then
+                updateVisual(p, character, humanoid, visible(camera, params, character, head.Position) and green or red, camera)
+            end
+        end
+    end
+end
+local function updateTrigger(camera, params, now)
+    if not Config.Trigger then triggerTarget = nil; return end
+    local center = camera.ViewportSize * 0.5
+    local ray = camera:ViewportPointToRay(center.X, center.Y)
+    local hit = Workspace:Raycast(ray.Origin, ray.Direction * Config.MaxDistance, params)
+    local target
+    if hit then
+        for _, p in ipairs(getTargets()) do
+            local character = enemy(p) and alive(p)
+            if character and hit.Instance:IsDescendantOf(character) and not character:FindFirstChildOfClass("ForceField") then
+                target = p; break
+            end
+        end
+    end
+    if not target then triggerTarget = nil; return end
+    if target ~= triggerTarget then triggerTarget, triggerSince = target, now end
+    if now - triggerSince >= Config.TriggerDelay then fire(now) end
+end
+local function updateCombat(camera, params, dt)
+    local myCharacter, _, myRoot, myHead = alive(player)
+    if menuOpen or GuiService.MenuIsOpen or not focused or drag or UIS:GetFocusedTextBox() or not myCharacter then
+        resetCombat()
+        if GuiService.MenuIsOpen then return "Paused: Roblox menu open" end
+        if menuOpen then return "SETTINGS: click PLAY to enable combat helpers" end
+        if not focused then return "Paused: window not focused" end
+        if not myCharacter then return "Waiting for a live standard character" end
+        if drag then return "Paused: moving controls" end
+        return "Paused: typing"
+    end
+    if not combatViewAllowed(camera, myHead) then
+        resetCombat()
+        if Config.NPCOnly then return "NPC aim paused: turn OFF first-person-only for third-person games" end
+        return "Combat paused: third-person camera"
+    end
+    local pressed = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+    if not pressed then aimReady = true end
+    local aimHeld = Config.Aim and aimReady and pressed
+    local now, center = os.clock(), camera.ViewportSize * 0.5
+    local candidates, rageTarget, bestRage = {}, nil, math.huge
+    if aimHeld or Config.Rage then
+        for _, p in ipairs(getTargets()) do
+            if enemy(p) then
+                local character, _, root, head = alive(p)
+                if character and not character:FindFirstChildOfClass("ForceField")
+                    and (head.Position - camera.CFrame.Position).Magnitude <= Config.MaxDistance then
+                    local point, onScreen = camera:WorldToViewportPoint(head.Position)
+                    local candidate = {player = p, character = character, head = head, root = root,
+                        onScreen = onScreen and point.Z > 0,
+                        distance = (Vector2.new(point.X, point.Y) - center).Magnitude,
+                        seen = not Config.VisibleOnly or visible(camera, params, character, head.Position)}
+                    table.insert(candidates, candidate)
+                    local distance = (root.Position - myRoot.Position).Magnitude
+                    if distance < bestRage then bestRage, rageTarget = distance, candidate end
+                end
+            end
+        end
+    end
+    if Config.Rage then
+        aimLock, aimTrack, triggerTarget = nil, nil, nil
+        if not rageTarget then return "Rage: no eligible target" end
+        local pose = lookAt(rageTarget.root.Position + Vector3.new(0, Config.RageHeight, 0), rageTarget.head.Position)
+        if pose then
+            myRoot.CFrame, myRoot.AssemblyLinearVelocity = pose, Vector3.zero
+            local view = lookAt(camera.CFrame.Position, rageTarget.head.Position, camera.CFrame.UpVector)
+            if view then camera.CFrame = view end
+            if visible(camera, params, rageTarget.character, rageTarget.head.Position) then fire(now) end
+        end
+        return "Rage active (overrides normal aim)"
+    end
+    local selected, reason = chooseAimTarget(candidates, now, aimHeld)
+    if Config.NPCOnly and aimHeld and not selected and not aimLock then
+        if #candidates == 0 then
+            reason = "No eligible NPCs: check scan, range, or ForceField"
+        else
+            local inFOV = false
+            for _, candidate in ipairs(candidates) do
+                if candidate.onScreen and candidate.distance <= Config.FOV then inFOV = true; break end
+            end
+            reason = inFOV and "NPCs in FOV blocked by visibility check" or "NPCs found, but outside FOV"
+        end
+    end
+    if not Config.Aim then reason = "Aimbot OFF: RightShift to enable"
+    elseif not aimReady then reason = "Release RMB, then press and hold it"
+    elseif not aimHeld then reason = "Aimbot ready: hold RMB" end
+    if selected then
+        local aimPoint = updateAimTracking(selected, dt)
+        -- Use world-up for normal aim, rather than importing game camera roll.
+        local target = lookAt(camera.CFrame.Position, aimPoint)
+        if target then
+            local strength = math.clamp(Config.AimStrength, 1, 450)
+            if strength >= 450 or Config.Smoothing <= 0 then camera.CFrame = target
+            else
+                -- Continue our previous orientation even if the game rewrites
+                -- its camera before this callback. Keep the current position.
+                local start = aimTrack.rotation and CFrame.new(camera.CFrame.Position) * aimTrack.rotation or camera.CFrame
+                camera.CFrame = start:Lerp(target, 1 - math.exp(-dt * (strength / 100) / Config.Smoothing))
+            end
+            aimTrack.rotation = camera.CFrame.Rotation
+        end
+    elseif aimHeld and aimLock and aimTrack and aimTrack.rotation then
+        -- Brief occlusion: hold orientation without following the hidden target.
+        -- This prevents a return to the raw camera and snap-back on the next frame.
+        camera.CFrame = CFrame.new(camera.CFrame.Position) * aimTrack.rotation
+    else
+        aimTrack = nil
+    end
+    updateTrigger(camera, params, now)
+    return reason
+end
+
+local lastCamera, lastError = nil, -math.huge
+local nextNPCSummary = 0
+local function frame(dt)
+    syncFullbright(Config.Fullbright)
+    local camera = Workspace.CurrentCamera
+    if camera ~= lastCamera then
+        -- Scope/camera replacements need a new blend origin, not a fresh RMB press.
+        if aimTrack then aimTrack.rotation = nil end
+        triggerTarget = nil
+        lastCamera = camera
+    end
+    if not camera then api.Status = "Waiting for camera"; return end
+    resizeWindow()
+    local center = camera.ViewportSize * 0.5
+    circle.Position, circle.Size = UDim2.fromOffset(center.X, center.Y), UDim2.fromOffset(Config.FOV * 2, Config.FOV * 2)
+    circle.Visible = Config.ShowFOV
+    local params = rayParams(camera)
+    api.Status = updateCombat(camera, params, dt)
+    -- Keep the last actual aim attempt after RMB release so opening settings
+    -- doesn't replace the useful failure reason with "hold RMB" or "paused".
+    if not menuOpen and (Config.Rage or not Config.Aim
+        or UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)) then
+        lastGameplayStatus = api.Status
+    end
+    if menuOpen and Config.NPCOnly and os.clock() >= nextNPCSummary then
+        getTargets()
+        nextNPCSummary = os.clock() + 0.5
+    end
+    status.Text = (menuOpen and "Settings paused\nLast: " .. lastGameplayStatus or api.Status)
+        .. (Config.NPCOnly and "\n" .. npcSummary or "") .. (fireIssue and "\n" .. fireIssue or "")
+    renderESP(camera, params)
+end
+-- One late callback. Custom game scripts writing later may still conflict.
+RunService:BindToRenderStep(bindName, Enum.RenderPriority.Last.Value + 1, function(dt)
+    if not active then return end
+    local ok, err = pcall(frame, dt)
+    -- A cursor error cannot escape this callback or block the stop key's cleanup.
+    local cursorOK, cursorError = pcall(syncCursor)
+    if not ok or not cursorOK then
+        resetCombat()
+        api.Status = "Error: " .. tostring(not cursorOK and cursorError or err)
+        status.Text = api.Status
+        if os.clock() - lastError > 3 then lastError = os.clock(); warn(api.Status) end
+    end
+end)
+setMenu(false, false)
